@@ -586,6 +586,134 @@ s32 wifi_qsap_reload_softap()
     return eSUCCESS;
 }
 
+static pid_t wigigSoftApPid = 0;
+static const char WIGIG_ENTROPY_FILE[]  = "/data/misc/wifi/wigig_entropy.bin";
+static unsigned char dummy_key[21]      = { 0x02, 0x11, 0xbe, 0x33, 0x43, 0x35,
+                                            0x68, 0x47, 0x84, 0x99, 0xa9, 0x2b,
+                                            0x1c, 0xd3, 0xee, 0xff, 0xf1, 0xe2,
+                                            0xf3, 0xf4, 0xf5 };
+static const char HOSTAPD_BIN_FILE[]     = "/system/bin/hostapd";
+static const char WIGIG_HOSTAPD_CONF_FILE[] = "/data/misc/wifi/wigig_hostapd.conf";
+#define AP_BSS_START_DELAY 200000
+#define AP_BSS_STOP_DELAY  500000
+
+int wigig_ensure_entropy_file_exists()
+{
+    int ret;
+    int destfd;
+
+    ret = access(WIGIG_ENTROPY_FILE, R_OK|W_OK);
+    if ((ret == 0) || (errno == EACCES)) {
+        if ((ret != 0) &&
+            (chmod(WIGIG_ENTROPY_FILE, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP) != 0)) {
+            ALOGE("Cannot set RW to \"%s\": %s", WIGIG_ENTROPY_FILE, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+    destfd = TEMP_FAILURE_RETRY(open(WIGIG_ENTROPY_FILE, O_CREAT|O_RDWR, 0660));
+    if (destfd < 0) {
+        ALOGE("Cannot create \"%s\": %s", WIGIG_ENTROPY_FILE, strerror(errno));
+        return -1;
+    }
+
+    if (TEMP_FAILURE_RETRY(write(destfd, dummy_key, sizeof(dummy_key))) != sizeof(dummy_key)) {
+        ALOGE("Error writing \"%s\": %s", WIGIG_ENTROPY_FILE, strerror(errno));
+        close(destfd);
+        return -1;
+    }
+    close(destfd);
+
+    /* chmod is needed because open() didn't set permisions properly */
+    if (chmod(WIGIG_ENTROPY_FILE, 0660) < 0) {
+        ALOGE("Error changing permissions of %s to 0660: %s",
+              WIGIG_ENTROPY_FILE, strerror(errno));
+        unlink(WIGIG_ENTROPY_FILE);
+        return -1;
+    }
+
+    if (chown(WIGIG_ENTROPY_FILE, AID_SYSTEM, AID_WIFI) < 0) {
+        ALOGE("Error changing group ownership of %s to %d: %s",
+              WIGIG_ENTROPY_FILE, AID_WIFI, strerror(errno));
+        unlink(WIGIG_ENTROPY_FILE);
+        return -1;
+    }
+    return 0;
+}
+
+s32 wifi_qsap_start_wigig_softap(void)
+{
+    pid_t pid = 1;
+
+    ALOGD("%s", __func__);
+
+    if (wigigSoftApPid) {
+        ALOGE("Wigig SoftAP is already running");
+        return eERR_START_SAP;
+    }
+
+    if (wigig_ensure_entropy_file_exists() < 0) {
+        ALOGE("Wigig entropy file was not created");
+    }
+
+    if ((pid = fork()) < 0) {
+        ALOGE("fork failed (%s)", strerror(errno));
+        return eERR_START_SAP;
+    }
+
+    if (!pid) {
+        if (execl(HOSTAPD_BIN_FILE, HOSTAPD_BIN_FILE,
+                  "-e", WIGIG_ENTROPY_FILE, "-dd",
+                  WIGIG_HOSTAPD_CONF_FILE, (char *) NULL)) {
+            ALOGE("execl failed (%s)", strerror(errno));
+        }
+        ALOGE("Wigig SoftAP failed to start. Exiting child process...");
+        exit(-1);
+    }
+
+    wigigSoftApPid = pid;
+    ALOGD("Wigig SoftAP started successfully");
+    usleep(AP_BSS_START_DELAY);
+
+    return eSUCCESS;
+}
+
+s32 wifi_qsap_stop_wigig_softap(void)
+{
+    ALOGD("%s", __func__);
+
+    if (wigigSoftApPid == 0) {
+        ALOGE("Wigig SoftAP is not running");
+        return eSUCCESS;
+    }
+
+    ALOGD("Stopping the Wigig SoftAP...");
+    kill(wigigSoftApPid, SIGTERM);
+    waitpid(wigigSoftApPid, NULL, 0);
+
+    wigigSoftApPid = 0;
+    ALOGD("Wigig SoftAP stopped successfully");
+    usleep(AP_BSS_STOP_DELAY);
+    return eSUCCESS;
+}
+
+int qsap_prepare_softap()
+{
+    ALOGD("Starting fstman\n");
+    return wifi_start_fstman(TRUE);
+}
+
+int qsap_unprepare_softap()
+{
+    ALOGD("Stopping fstman\n");
+    return wifi_stop_fstman(TRUE);
+}
+
+int qsap_is_fst_enabled()
+{
+    return is_fst_enabled();
+}
+
 s32 wifi_qsap_set_tx_power(s32 tx_power)
 {
 #define QCSAP_IOCTL_SET_MAX_TX_POWER   (SIOCIWFIRSTPRIV + 22)
@@ -626,80 +754,4 @@ s32 wifi_qsap_set_tx_power(s32 tx_power)
     }
 
     return ret;
-}
-
-s32 wifi_qsap_set_tx_power(s32 tx_power)
-{
-#define QCSAP_IOCTL_SET_MAX_TX_POWER   (SIOCIWFIRSTPRIV + 22)
-    s32 sock;
-    s32 ret = eERR_SET_TX_POWER;
-    s8  interface[128];
-    s8  *iface;
-    s32 len = 128;
-    struct iwreq wrq;
-
-    if(NULL == (iface = qsap_get_config_value(CONFIG_FILE, &qsap_str[STR_INTERFACE], interface, (u32*)&len))) {
-        ALOGE("%s :interface error \n", __func__);
-        return ret;
-    }
-
-    /* Issue QCSAP_IOCTL_SET_MAX_TX_POWER ioctl */
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-
-    if (sock < 0) {
-        ALOGE("%s :socket error \n", __func__);
-        return eERR_SET_TX_POWER;
-    }
-
-    strlcpy(wrq.ifr_name, iface, sizeof(wrq.ifr_name));
-    wrq.u.data.length = sizeof(s32);
-    wrq.u.data.pointer = &tx_power;
-    wrq.u.data.flags = 0;
-
-    ret = ioctl(sock, QCSAP_IOCTL_SET_MAX_TX_POWER, &wrq);
-    close(sock);
-
-    if (ret) {
-        ALOGE("%s :IOCTL set tx power failed: %ld\n", __func__, ret);
-        ret = eERR_SET_TX_POWER;
-    } else {
-        ALOGD("%s :IOCTL set tx power issued\n", __func__);
-        ret = eSUCCESS;
-    }
-
-    return ret;
-}
-
-int qsap_prepare_softap()
-{
-    ALOGD("Starting fstman\n");
-    return wifi_start_fstman(TRUE);
-}
-
-int qsap_unprepare_softap()
-{
-    ALOGD("Stopping fstman\n");
-    return wifi_stop_fstman(TRUE);
-}
-
-int qsap_is_fst_enabled()
-{
-    return is_fst_enabled();
-}
-
-int qsap_prepare_softap()
-{
-    ALOGD("Starting fstman\n");
-    return wifi_start_fstman(TRUE);
-}
-
-int qsap_unprepare_softap()
-{
-    ALOGD("Stopping fstman\n");
-    return wifi_stop_fstman(TRUE);
-}
-
-int qsap_is_fst_enabled()
-{
-    return is_fst_enabled();
 }
