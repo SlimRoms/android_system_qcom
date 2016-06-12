@@ -54,6 +54,7 @@
 
 #include "qsap_api.h"
 #include "qsap.h"
+#include "wifi_fst.h"
 
 #include <sys/system_properties.h>
 
@@ -667,4 +668,38 @@ s32 wifi_qsap_set_tx_power(s32 tx_power)
     }
 
     return ret;
+}
+
+int qsap_prepare_softap()
+{
+    ALOGD("Starting fstman\n");
+    return wifi_start_fstman(TRUE);
+}
+
+int qsap_unprepare_softap()
+{
+    ALOGD("Stopping fstman\n");
+    return wifi_stop_fstman(TRUE);
+}
+
+int qsap_is_fst_enabled()
+{
+    return is_fst_enabled();
+}
+
+int qsap_prepare_softap()
+{
+    ALOGD("Starting fstman\n");
+    return wifi_start_fstman(TRUE);
+}
+
+int qsap_unprepare_softap()
+{
+    ALOGD("Stopping fstman\n");
+    return wifi_stop_fstman(TRUE);
+}
+
+int qsap_is_fst_enabled()
+{
+    return is_fst_enabled();
 }
